@@ -62,6 +62,23 @@ pub trait Transport {
     }
 }
 
+// Allow `Device::new(&mut some_transport)` instead of moving ownership.
+// Useful for host applications (e.g. Phosphor) where the same USB
+// connection is shared between the playback path and the config path —
+// the playback layer keeps the handle and lends a `&mut self` reference
+// for the duration of a config operation.
+impl<T: Transport + ?Sized> Transport for &mut T {
+    fn send(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
+        (**self).send(bytes)
+    }
+    fn recv(&mut self, len: usize) -> Result<Vec<u8>, TransportError> {
+        (**self).recv(len)
+    }
+    fn drain(&mut self) -> Result<(), TransportError> {
+        (**self).drain()
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  StandaloneTransport — direct rusb backend
 // ─────────────────────────────────────────────────────────────────────────────
