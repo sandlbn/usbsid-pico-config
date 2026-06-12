@@ -83,18 +83,6 @@ byte 2-5 arguments    command-specific
 
 Command bytes ≥ 0x40 cover presets, hardware detection, version queries, and CONFIG_ACK. The full enum is in [`src/protocol.rs`](src/protocol.rs).
 
-## Tested against
-
-- USBSID-Pico firmware **0.7.0**, PCB **v1.3**
-
-Other firmware revisions should work for the common path. Unknown enum values surface as `ConfigError::UnknownEnumId`; call `read_config_lenient()` to map them to `Unknown` instead of erroring.
-
-## Status
-
-- Read path stable, all unit tests passing (21/21)
-- Write path validated end-to-end on real hardware via the integration suite at [`tests/real_device.rs`](tests/real_device.rs)
-- `READ_SOCKETCFG`, `AUTO_DETECT`, `DETECT_CLONES`, MIDI / audio-toggle commands wired but not exhaustively tested - use at your own risk
-
 ## License
 
 MIT OR Apache-2.0
