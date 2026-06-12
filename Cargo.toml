@@ -1,0 +1,24 @@
+[package]
+name = "usbsid-pico-config"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Configuration protocol for USBSID-Pico hardware."
+license = "MIT OR Apache-2.0"
+keywords = ["sid", "commodore", "c64", "usb", "usbsid-pico"]
+categories = ["hardware-support", "multimedia::audio"]
+repository = "https://github.com/sandlbn/usbsid-pico-config"
+
+[features]
+# Default includes the rusb-backed standalone transport so the crate is
+# "just works" for CLI consumers. Set `default-features = false` if you
+# wire your own Transport (e.g. through an existing USB daemon).
+default = ["rusb-transport"]
+rusb-transport = ["dep:rusb"]
+
+[dependencies]
+thiserror = "1"
+rusb = { version = "0.9", optional = true }
+
+[dev-dependencies]
+# Nothing exotic — keep `cargo test` cheap.
