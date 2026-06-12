@@ -4,12 +4,12 @@ Rust crate to read and write [USBSID-Pico](https://github.com/LouDnl/USBSID-Pico
 
 ## Features
 
-- Read/write the device's 64-byte configuration buffer
+- Read/write the device's configuration
 - Built-in presets (single / dual / triple / quad / mirrored / flipped / mixed)
 - Clock rate selection (PAL / NTSC / DREAN / NTSC2 / default)
-- Chip-type routing per socket (real SID + 8 clone models)
+- Chip-type routing per socket
 - Firmware + PCB version readout
-- Hardware SID detection (`detect-sids`, `auto-detect`, `detect-clones`)
+- SID detection
 
 ## Usage
 
