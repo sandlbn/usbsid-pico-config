@@ -32,6 +32,8 @@ For host applications that already own the USB session (e.g. through a privilege
 usbsid-pico-config = { version = "0.1", default-features = false }
 ```
 
+If the host already uses [`usbsid-pico`](https://crates.io/crates/usbsid-pico) (≥ 0.1.10) for playback, wrap its `UsbSid::send_raw` / `recv_raw_timeout` to implement `Transport` — the two crates share one libusb session.
+
 ## CLI
 
 ```sh

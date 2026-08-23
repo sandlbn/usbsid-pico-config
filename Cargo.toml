@@ -1,6 +1,6 @@
 [package]
 name = "usbsid-pico-config"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Configuration protocol for USBSID-Pico hardware."
@@ -15,6 +15,10 @@ repository = "https://github.com/sandlbn/usbsid-pico-config"
 # wire your own Transport (e.g. through an existing USB daemon).
 default = ["rusb-transport"]
 rusb-transport = ["dep:rusb"]
+# Opt-in FPGASID diagnostic parser + Device helper. Isolated because it's
+# a niche readback for one specific clone chip — most callers never touch
+# it. Adds only pure-Rust code, no new deps.
+fpgasid = []
 
 [dependencies]
 thiserror = "1"

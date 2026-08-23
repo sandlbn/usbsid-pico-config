@@ -283,11 +283,14 @@ pub struct ProtocolToggles {
 /// generate the SET_CONFIG triplets that push it back to the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceConfig {
-    /// True on v1.5+ boards that need an explicit CONFIG_ACK after first
-    /// connection before they enable socket power rails.
+    /// v1.5+: needs `CONFIG_ACK` before socket power rails come up.
     pub need_confirmation: bool,
-    /// Diagnostic: socket change-detection has been disabled in firmware.
+    /// v1.5+: socket change-detect disabled. (SET_CONFIG section `0xF`.)
     pub disable_changedetect: bool,
+    /// v1.5+: preset-autodetect (byte 4 bit 7). SET_CONFIG section `0x10`.
+    pub preset_auto_detect: bool,
+    /// v1.5+: last-applied preset id (byte 4 bits 0-6). READ-ONLY.
+    pub last_preset: u8,
 
     pub lock_clockrate: bool,
     pub external_clock: bool,
@@ -350,5 +353,285 @@ impl Preset {
             Self::QuadMixed => "QUAD MIXED",
             Self::QuadFlipMixed => "QUAD FLIP+MIX",
         }
+    }
+}
+
+// ─── PCB revision + capability gating ────────────────────────────────────
+
+/// PCB revision decoded from `US_PCB_VERSION` (e.g. `"1.5"`).
+///
+/// [`raw`](Self::raw) returns Clojure's folded integer form (`"1.5"` → 15)
+/// for numeric feature comparisons; [`fw_capabilities`] is the preferred
+/// API for gating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PcbVersion {
+    V1_0,
+    V1_3,
+    V1_4,
+    V1_5,
+    /// Anything newer than v1.5, stored as the folded integer.
+    Newer(u32),
+    Unknown,
+}
+
+impl PcbVersion {
+    pub fn raw(self) -> u32 {
+        match self {
+            Self::V1_0 => 10,
+            Self::V1_3 => 13,
+            Self::V1_4 => 14,
+            Self::V1_5 => 15,
+            Self::Newer(v) => v,
+            Self::Unknown => 0,
+        }
+    }
+
+    pub fn from_raw(raw: u32) -> Self {
+        match raw {
+            0 => Self::Unknown,
+            r if r >= 16 => Self::Newer(r),
+            15 => Self::V1_5,
+            14 => Self::V1_4,
+            13 => Self::V1_3,
+            _ => Self::V1_0,
+        }
+    }
+}
+
+/// Parse `"1.5"` / `"v1.5"` / `"1.5.0"` into Clojure's folded integer form
+/// (`major * 10 + min(minor, 9)`). `None` on blank / unparseable input.
+pub fn parse_pcb_version(s: &str) -> Option<u32> {
+    let trimmed = s.trim().trim_start_matches(|c: char| c == 'v' || c == 'V');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut parts = trimmed.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next().map_or(Some(0), |m| m.parse().ok())?;
+    Some(major * 10 + minor.min(9))
+}
+
+/// Feature flags derived from the PCB revision — mirrors Clojure
+/// `fw-capabilities`. Every field is `false` for `PcbVersion::Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Capabilities {
+    pub audio_switch: bool,
+    pub presets_v15: bool,
+    pub autodetect: bool,
+    pub mixed: bool,
+    pub lock_audio_switch: bool,
+    pub external_clock: bool,
+    pub rgb_led: bool,
+    pub fpga_diag: bool,
+}
+
+/// Firmware wire-format flavor.
+///
+/// `V07` is current firmware; `Legacy` is v0.5/v0.6 (byte 22 = mirrored,
+/// bytes 12/13 + 23/24 = split `{chiptype, clonetype}`, sections
+/// `0xC..=0x10` absent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FwFlavor {
+    #[default]
+    V07,
+    Legacy,
+}
+
+/// `Legacy` when the firmware string parses as `0.x` with `x < 7`, else
+/// `V07`. Unparseable input defaults to `V07`.
+pub fn fw_flavor_from_version(s: &str) -> FwFlavor {
+    let trimmed = s.trim().trim_start_matches(|c: char| c == 'v' || c == 'V');
+    let mut parts = trimmed.split('.');
+    let major: u32 = match parts.next().and_then(|p| p.parse().ok()) {
+        Some(m) => m,
+        None => return FwFlavor::V07,
+    };
+    let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    if major == 0 && minor < 7 {
+        FwFlavor::Legacy
+    } else {
+        FwFlavor::V07
+    }
+}
+
+/// Legacy `{chiptype, clonetype}` byte pair → flat [`ChipType`].
+/// Mirrors Clojure `config_model.clj:97 legacy->flat-chip`.
+pub fn legacy_to_flat_chip(chiptype: u8, clonetype: u8) -> ChipType {
+    match chiptype {
+        0 => ChipType::Real,
+        2 => ChipType::Unknown,
+        1 => match clonetype {
+            2 => ChipType::SkPico,
+            3 => ChipType::ArmSid,
+            4 => ChipType::FpgaSid,
+            5 => ChipType::RedipSid,
+            _ => ChipType::Unknown,
+        },
+        _ => ChipType::Unknown,
+    }
+}
+
+/// Inverse of [`legacy_to_flat_chip`]. `None` for chips with no legacy
+/// mapping (`Arm2Sid`, `PdSid`, `BackSid`, `SidEmu`) — legacy encoder
+/// silently drops those writes.
+pub fn flat_chip_to_legacy(chip: ChipType) -> Option<(u8, u8)> {
+    match chip {
+        ChipType::Real => Some((0, 0)),
+        ChipType::Unknown => Some((2, 0)),
+        ChipType::SkPico => Some((1, 2)),
+        ChipType::ArmSid => Some((1, 3)),
+        ChipType::FpgaSid => Some((1, 4)),
+        ChipType::RedipSid => Some((1, 5)),
+        _ => None,
+    }
+}
+
+/// Capability set for a PCB revision. Thresholds: 13 → audio-switch;
+/// 15 → v1.5+ bundle (presets, autodetect, mixed, external clock, RGB
+/// LED, FPGASID diag).
+pub fn fw_capabilities(pcb_ver: u32) -> Capabilities {
+    let v13 = pcb_ver >= 13;
+    let v15 = pcb_ver >= 15;
+    Capabilities {
+        audio_switch: v13,
+        lock_audio_switch: v13,
+        presets_v15: v15,
+        autodetect: v15,
+        mixed: v15,
+        external_clock: v15,
+        rgb_led: v15,
+        fpga_diag: v15,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_pcb_version_common() {
+        assert_eq!(parse_pcb_version("1.5"), Some(15));
+        assert_eq!(parse_pcb_version("1.3"), Some(13));
+        assert_eq!(parse_pcb_version("1.0"), Some(10));
+        assert_eq!(parse_pcb_version("2.0"), Some(20));
+    }
+
+    #[test]
+    fn parse_pcb_version_v_prefix_and_whitespace() {
+        assert_eq!(parse_pcb_version("v1.5"), Some(15));
+        assert_eq!(parse_pcb_version("V1.4"), Some(14));
+        assert_eq!(parse_pcb_version("  1.5  "), Some(15));
+    }
+
+    #[test]
+    fn parse_pcb_version_three_component_takes_only_major_minor() {
+        // Real firmware never returns three-component versions, but be liberal.
+        assert_eq!(parse_pcb_version("1.5.0"), Some(15));
+        assert_eq!(parse_pcb_version("1.5.99"), Some(15));
+    }
+
+    #[test]
+    fn parse_pcb_version_lone_major() {
+        assert_eq!(parse_pcb_version("1"), Some(10));
+        assert_eq!(parse_pcb_version("2"), Some(20));
+    }
+
+    #[test]
+    fn parse_pcb_version_garbage_returns_none() {
+        assert_eq!(parse_pcb_version(""), None);
+        assert_eq!(parse_pcb_version("   "), None);
+        assert_eq!(parse_pcb_version("banana"), None);
+        assert_eq!(parse_pcb_version("1.x"), None);
+    }
+
+    #[test]
+    fn pcb_version_roundtrip() {
+        for (raw, expected) in [
+            (0, PcbVersion::Unknown),
+            (10, PcbVersion::V1_0),
+            (12, PcbVersion::V1_0),
+            (13, PcbVersion::V1_3),
+            (14, PcbVersion::V1_4),
+            (15, PcbVersion::V1_5),
+            (16, PcbVersion::Newer(16)),
+        ] {
+            let v = PcbVersion::from_raw(raw);
+            assert_eq!(v, expected, "from_raw({raw})");
+        }
+        // Fold-preserving for known variants.
+        assert_eq!(PcbVersion::V1_5.raw(), 15);
+        assert_eq!(PcbVersion::V1_3.raw(), 13);
+    }
+
+    #[test]
+    fn fw_flavor_from_version_boundary() {
+        assert_eq!(fw_flavor_from_version("0.5.0"), FwFlavor::Legacy);
+        assert_eq!(fw_flavor_from_version("0.6.4"), FwFlavor::Legacy);
+        assert_eq!(fw_flavor_from_version("0.7.0"), FwFlavor::V07);
+        assert_eq!(fw_flavor_from_version("1.0.0"), FwFlavor::V07);
+        // Unparseable defaults to V07 — current is the safe assumption.
+        assert_eq!(fw_flavor_from_version(""), FwFlavor::V07);
+        assert_eq!(fw_flavor_from_version("garbage"), FwFlavor::V07);
+        // Optional leading 'v' tolerated.
+        assert_eq!(fw_flavor_from_version("v0.6.4"), FwFlavor::Legacy);
+    }
+
+    #[test]
+    fn legacy_chip_mapping_roundtrip() {
+        // Chips WITH a legacy mapping should survive to_legacy → from_legacy.
+        for chip in [
+            ChipType::Real,
+            ChipType::Unknown,
+            ChipType::SkPico,
+            ChipType::ArmSid,
+            ChipType::FpgaSid,
+            ChipType::RedipSid,
+        ] {
+            let (ct, cl) = flat_chip_to_legacy(chip).expect("has legacy mapping");
+            assert_eq!(legacy_to_flat_chip(ct, cl), chip, "chip = {chip:?}");
+        }
+        // Chips WITHOUT a legacy mapping return None from the encoder.
+        for chip in [
+            ChipType::Arm2Sid,
+            ChipType::PdSid,
+            ChipType::BackSid,
+            ChipType::SidEmu,
+        ] {
+            assert_eq!(
+                flat_chip_to_legacy(chip),
+                None,
+                "chip {chip:?} should have no legacy mapping"
+            );
+        }
+        // Unrecognised legacy clonetype bytes collapse to Unknown.
+        assert_eq!(legacy_to_flat_chip(1, 99), ChipType::Unknown);
+        assert_eq!(legacy_to_flat_chip(9, 9), ChipType::Unknown);
+    }
+
+    #[test]
+    fn fw_capabilities_boundaries() {
+        // Unknown / <1.3: nothing.
+        let none = fw_capabilities(0);
+        assert!(!none.audio_switch && !none.presets_v15 && !none.rgb_led);
+
+        // v1.3: audio switch only.
+        let v13 = fw_capabilities(13);
+        assert!(v13.audio_switch);
+        assert!(v13.lock_audio_switch);
+        assert!(!v13.presets_v15);
+        assert!(!v13.rgb_led);
+
+        // v1.4: still just the v1.3 stuff.
+        let v14 = fw_capabilities(14);
+        assert!(v14.audio_switch && !v14.presets_v15);
+
+        // v1.5: full bundle.
+        let v15 = fw_capabilities(15);
+        assert!(v15.audio_switch && v15.presets_v15 && v15.autodetect);
+        assert!(v15.mixed && v15.external_clock && v15.rgb_led && v15.fpga_diag);
+
+        // Newer inherits v1.5 bundle.
+        let v16 = fw_capabilities(16);
+        assert!(v16.presets_v15 && v16.rgb_led);
     }
 }

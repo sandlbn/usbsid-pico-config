@@ -34,14 +34,21 @@
 //!   host app keeps full control of session management, retries, and IPC.
 
 pub mod device;
+#[cfg(feature = "fpgasid")]
+pub mod fpgasid;
+pub mod ini_io;
 pub mod model;
 pub mod protocol;
 pub mod transport;
 
 pub use device::Device;
+#[cfg(feature = "fpgasid")]
+pub use fpgasid::{parse_diag as parse_fpgasid_diag, FpgaSidDiag, FpgaSidError, FpgaSidSlotConfig};
+pub use ini_io::{read_ini, read_ini_version, write_ini};
 pub use model::{
-    ChipType, ClockRate, DeviceConfig, LedConfig, Preset, ProtocolToggles, RgbLedConfig, SidSlot,
-    SidType, SocketConfig,
+    flat_chip_to_legacy, fw_capabilities, fw_flavor_from_version, legacy_to_flat_chip,
+    parse_pcb_version, Capabilities, ChipType, ClockRate, DeviceConfig, FwFlavor, LedConfig,
+    PcbVersion, Preset, ProtocolToggles, RgbLedConfig, SidSlot, SidType, SocketConfig,
 };
 pub use protocol::{ConfigError, CONFIG_BUFFER_LEN};
 pub use transport::{Transport, TransportError};

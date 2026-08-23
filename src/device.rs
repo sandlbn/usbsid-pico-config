@@ -4,7 +4,7 @@
 //! `apply`, `save_to_flash`, `apply_preset`, …) that callers can use
 //! without thinking about packet bytes.
 
-use crate::model::{DeviceConfig, Preset};
+use crate::model::{fw_flavor_from_version, DeviceConfig, FwFlavor, Preset};
 use crate::protocol::{self, cfg, ConfigError, CONFIG_BUFFER_LEN};
 use crate::transport::{Transport, TransportError};
 use thiserror::Error;
@@ -28,43 +28,91 @@ pub enum DeviceError {
 /// or a host-side daemon bridge.
 pub struct Device<T: Transport> {
     transport: T,
+    fw_flavor: FwFlavor,
 }
 
 impl<T: Transport> Device<T> {
-    /// Wrap an open transport.
+    /// Wrap a transport. Firmware flavor defaults to [`FwFlavor::V07`];
+    /// call [`Self::detect_fw_flavor`] or [`Self::set_fw_flavor`] before
+    /// config I/O if the target may be legacy fw.
     pub fn new(transport: T) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            fw_flavor: FwFlavor::V07,
+        }
     }
 
-    /// Borrow the underlying transport (useful for caller-side stats / logs).
     pub fn transport(&self) -> &T {
         &self.transport
     }
 
-    /// Borrow the underlying transport mutably.
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.transport
     }
 
-    /// Read the device's current configuration (64-byte READ_CONFIG response,
-    /// decoded into a [`DeviceConfig`]).
-    pub fn read_config(&mut self) -> Result<DeviceConfig, DeviceError> {
-        self.transport.drain()?;
-        self.transport.send(&protocol::encode_read_config())?;
-        let buf = self.transport.recv(CONFIG_BUFFER_LEN)?;
-        let cfg = protocol::decode_config(&buf)?;
-        Ok(cfg)
+    pub fn fw_flavor(&self) -> FwFlavor {
+        self.fw_flavor
     }
 
-    /// Best-effort read: unknown enum values map to `Unknown` instead of
-    /// erroring. Use when interoperating with newer firmware than this
-    /// crate knows about.
+    pub fn set_fw_flavor(&mut self, flavor: FwFlavor) {
+        self.fw_flavor = flavor;
+    }
+
+    /// Read the firmware version and update [`Self::fw_flavor`] to match.
+    pub fn detect_fw_flavor(&mut self) -> Result<String, DeviceError> {
+        let ver = self.read_firmware_version()?;
+        self.fw_flavor = fw_flavor_from_version(&ver);
+        Ok(ver)
+    }
+
+    /// READ_CONFIG → decoded [`DeviceConfig`]. Retries 3× with 50 ms
+    /// delay; each attempt also falls back to the legacy 256-byte drain.
+    pub fn read_config(&mut self) -> Result<DeviceConfig, DeviceError> {
+        let buf = self.read_config_frame_with_retry()?;
+        Ok(protocol::decode_config_with(self.fw_flavor, &buf)?)
+    }
+
+    /// [`Self::read_config`] with unknown enum ids folded to `Unknown`
+    /// (v0.7 flavor only — legacy decode is always strict).
     pub fn read_config_lenient(&mut self) -> Result<DeviceConfig, DeviceError> {
-        self.transport.drain()?;
-        self.transport.send(&protocol::encode_read_config())?;
-        let buf = self.transport.recv(CONFIG_BUFFER_LEN)?;
-        let cfg = protocol::decode_config_lenient(&buf)?;
-        Ok(cfg)
+        let buf = self.read_config_frame_with_retry()?;
+        match self.fw_flavor {
+            FwFlavor::V07 => Ok(protocol::decode_config_lenient(&buf)?),
+            FwFlavor::Legacy => Ok(protocol::decode_config_legacy(&buf)?),
+        }
+    }
+
+    fn read_config_frame_with_retry(&mut self) -> Result<Vec<u8>, DeviceError> {
+        let mut last_detail = String::new();
+        for attempt in 0..3 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            self.transport.drain()?;
+            self.transport.send(&protocol::encode_read_config())?;
+
+            // 64B read; on error or bad framing fall through to 256B drain.
+            if let Ok(buf) = self.transport.recv(CONFIG_BUFFER_LEN) {
+                if let Some(frame) = protocol::try_extract_config_frame(&buf) {
+                    return Ok(frame.to_vec());
+                }
+            }
+
+            match self.transport.recv(CONFIG_BUFFER_LEN * 4) {
+                Ok(buf) => {
+                    if let Some(frame) = protocol::try_extract_config_frame(&buf) {
+                        return Ok(frame.to_vec());
+                    }
+                    last_detail = format!("no valid frame found in {}-byte drain", buf.len());
+                }
+                Err(e) => {
+                    last_detail = format!("recv 256B drain failed: {e}");
+                }
+            }
+        }
+        Err(DeviceError::Transport(TransportError::Io(format!(
+            "read_config: gave up after 3 attempts ({last_detail})"
+        ))))
     }
 
     /// Push a full [`DeviceConfig`] to the device (does NOT save to flash).
@@ -72,7 +120,7 @@ impl<T: Transport> Device<T> {
     /// callers shouldn't spam this in a tight loop.
     pub fn write_config(&mut self, cfg: &DeviceConfig) -> Result<(), DeviceError> {
         self.transport.drain()?;
-        for packet in protocol::config_to_set_packets(cfg) {
+        for packet in protocol::config_to_set_packets_with(self.fw_flavor, cfg) {
             self.transport.send(&packet)?;
         }
         Ok(())
@@ -192,6 +240,15 @@ impl<T: Transport> Device<T> {
         self.read_version_with_retry("PCB version", cfg::US_PCB_VERSION, |this| {
             this.transport.send(&protocol::encode_read_pcb_version())
         })
+    }
+
+    /// [`Self::read_pcb_version`] + parse into [`crate::PcbVersion`].
+    /// Unparseable replies fold to [`crate::PcbVersion::Unknown`].
+    pub fn read_pcb_version_typed(&mut self) -> Result<crate::PcbVersion, DeviceError> {
+        let raw = self.read_pcb_version()?;
+        Ok(crate::parse_pcb_version(&raw)
+            .map(crate::PcbVersion::from_raw)
+            .unwrap_or(crate::PcbVersion::Unknown))
     }
 
     fn read_version_with_retry(
@@ -317,8 +374,10 @@ mod tests {
         let sent_before = dev.transport().sent.len();
         dev.write_config(&cfg).unwrap();
         let sent_after = dev.transport().sent.len();
-        // 1 clock + 2 sockets * 5 items + 2 LED + 4 RGB + 6 audio routing flags = 23
-        assert_eq!(sent_after - sent_before, 23);
+        // 1 clock + 2 sockets * 5 items + 2 LED + 4 RGB + 6 audio routing
+        //   flags + 2 v1.5-only opcodes (socket_change_detect,
+        //   preset_auto_detect) = 25
+        assert_eq!(sent_after - sent_before, 25);
     }
 
     #[test]
@@ -334,5 +393,64 @@ mod tests {
         let resp = vec![cfg::US_PCB_VERSION, 3, b'1', b'.', b'5', 0, 0];
         let mut dev = Device::new(MockTransport::new().with_response(resp));
         assert_eq!(dev.read_pcb_version().unwrap(), "1.5");
+    }
+
+    #[test]
+    fn pcb_version_typed_maps_to_enum() {
+        let resp = vec![cfg::US_PCB_VERSION, 3, b'1', b'.', b'5', 0, 0];
+        let mut dev = Device::new(MockTransport::new().with_response(resp));
+        assert_eq!(
+            dev.read_pcb_version_typed().unwrap(),
+            crate::PcbVersion::V1_5
+        );
+    }
+
+    // ─── Ph4 retry + legacy-drain regression tests ──────────────────
+
+    #[test]
+    fn read_config_first_attempt_recovers_after_transient_failure() {
+        // First 64B read returns garbage (no valid framing), second
+        // attempt returns a proper PAL buffer. Retry should succeed.
+        let mut transport = MockTransport::new()
+            .with_response(vec![0xAA; CONFIG_BUFFER_LEN]) // attempt 1: bad framing
+            .with_response(vec![0xBB; CONFIG_BUFFER_LEN * 4]) // attempt 1: bad drain too
+            .with_response(pal_buffer().to_vec()); // attempt 2: good
+        let mut dev = Device::new(transport);
+        let cfg = dev.read_config().unwrap();
+        assert_eq!(cfg.clock_rate, crate::model::ClockRate::Pal);
+    }
+
+    #[test]
+    fn read_config_legacy_drain_picks_up_second_window() {
+        // Legacy firmware behaviour: single 64B recv returns something
+        // wrong-sized OR unframed, the 256B drain has the valid frame
+        // at the second 64-byte window.
+        let mut drained = vec![0x11u8; CONFIG_BUFFER_LEN]; // garbage window 0
+        drained.extend_from_slice(&pal_buffer()); // valid frame at offset 64
+        drained.extend_from_slice(&vec![0x22u8; CONFIG_BUFFER_LEN * 2]); // rest is filler
+        let transport = MockTransport::new()
+            .with_response(vec![]) // first 64B recv returns empty → falls through
+            .with_response(drained);
+        let mut dev = Device::new(transport);
+        let cfg = dev.read_config().unwrap();
+        assert_eq!(cfg.clock_rate, crate::model::ClockRate::Pal);
+    }
+
+    #[test]
+    fn read_config_gives_up_after_three_attempts() {
+        // Three full attempts of unreadable data → hard error.
+        let transport = MockTransport::new();
+        // Six garbage responses (3 attempts × [normal + drain]).
+        let mut transport = transport;
+        for _ in 0..6 {
+            transport = transport.with_response(vec![0xAA; CONFIG_BUFFER_LEN]);
+        }
+        let mut dev = Device::new(transport);
+        let err = dev.read_config().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("gave up after 3 attempts"),
+            "unexpected error message: {msg}"
+        );
     }
 }
