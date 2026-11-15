@@ -125,6 +125,15 @@ pub mod cfg {
     /// CONFIG_ACK for v1.5+ boards. The Clojure tool sends this at byte 0xFA.
     pub const CONFIG_ACK: u8 = 0xFA;
     pub const SOCKET_DETECT: u8 = 0xFD;
+    /// fw 0.9+: read compiled-in feature flags.
+    pub const US_FEATURES: u8 = 0x82;
+    /// fw 0.9+: USB RX ringbuffer on/off (`buffer[1]`); saves + reboots on change.
+    pub const SET_RX_RING: u8 = 0x83;
+    /// fw 0.9+: clock link on/off (`buffer[1]`); saves + reboots on change.
+    pub const LINK_CLOCK: u8 = 0x84;
+    /// fw 0.9+: preset silent auto-detect. Firmware reads `buffer[2]`
+    /// (SOCKET_DETECT reads `buffer[1]`) — send the value in both bytes.
+    pub const PRESET_DETECT: u8 = 0xFE;
 }
 
 /// SET_CONFIG "section" bytes.
@@ -284,7 +293,8 @@ pub fn decode_config(buf: &[u8]) -> Result<DeviceConfig, ConfigError> {
         last_preset: b[4] & 0x7F,
 
         lock_clockrate: b[5] != 0,
-        external_clock: b[6] != 0,
+        external_clock: (b[6] & 0x01) != 0,
+        clock_link: (b[6] & 0x02) != 0,
         clock_rate,
 
         socket1: decode_socket(b, SOCKET1_LAYOUT)?,
@@ -336,7 +346,8 @@ pub fn decode_config_lenient(buf: &[u8]) -> Result<DeviceConfig, ConfigError> {
                 preset_auto_detect: (b[4] & 0x80) != 0,
                 last_preset: b[4] & 0x7F,
                 lock_clockrate: b[5] != 0,
-                external_clock: b[6] != 0,
+                external_clock: (b[6] & 0x01) != 0,
+                clock_link: (b[6] & 0x02) != 0,
                 clock_rate: clock_rate_from_value(clock_val).unwrap_or(ClockRate::Pal),
                 socket1: decode_socket_lenient(b, SOCKET1_LAYOUT),
                 socket2: decode_socket_lenient(b, SOCKET2_LAYOUT),
@@ -630,7 +641,8 @@ pub fn decode_config_legacy(buf: &[u8]) -> Result<DeviceConfig, ConfigError> {
         last_preset: 0,
 
         lock_clockrate: b[5] != 0,
-        external_clock: b[6] != 0,
+        external_clock: (b[6] & 0x01) != 0,
+        clock_link: (b[6] & 0x02) != 0,
         clock_rate,
 
         socket1: SocketConfig {
@@ -793,7 +805,44 @@ pub fn decode_config_with(flavor: FwFlavor, buf: &[u8]) -> Result<DeviceConfig, 
     match flavor {
         FwFlavor::V07 => decode_config(buf),
         FwFlavor::Legacy => decode_config_legacy(buf),
+        FwFlavor::V075 | FwFlavor::V09 => decode_config(buf).map(|c| apply_flavor(flavor, c)),
     }
+}
+
+/// [`decode_config_lenient`] for any flavor.
+pub fn decode_config_lenient_with(
+    flavor: FwFlavor,
+    buf: &[u8],
+) -> Result<DeviceConfig, ConfigError> {
+    match flavor {
+        FwFlavor::Legacy => decode_config_legacy(buf),
+        _ => decode_config_lenient(buf).map(|c| apply_flavor(flavor, c)),
+    }
+}
+
+/// Fix up a V07-decoded config for newer wire semantics.
+fn apply_flavor(flavor: FwFlavor, mut cfg: DeviceConfig) -> DeviceConfig {
+    if flavor.change_detect_is_enable_bit() {
+        // Byte 3 is `socket_change_detect` (1 = on) since fw 0.7.5.
+        cfg.disable_changedetect = !cfg.disable_changedetect;
+    }
+    cfg
+}
+
+/// fw 0.9+: READ_CONFIG byte 59 = USB RX ringbuffer enabled.
+pub fn decode_rx_ring(buf: &[u8]) -> Result<bool, ConfigError> {
+    let b = validate_config_buffer(buf)?;
+    Ok(b[59] != 0)
+}
+
+/// CONFIG command packet: `[0xD2, cmd, a, b]` zero-padded.
+pub fn encode_config_cmd(cmd: u8, a: u8, b: u8) -> [u8; PACKET_LEN] {
+    let mut p = [0u8; PACKET_LEN];
+    p[0] = 0xD2;
+    p[1] = cmd;
+    p[2] = a;
+    p[3] = b;
+    p
 }
 
 /// Dispatcher: pick the encoder matching `flavor`.
@@ -801,6 +850,12 @@ pub fn config_to_set_packets_with(flavor: FwFlavor, cfg: &DeviceConfig) -> Vec<[
     match flavor {
         FwFlavor::V07 => config_to_set_packets(cfg),
         FwFlavor::Legacy => config_to_set_packets_legacy(cfg),
+        FwFlavor::V075 | FwFlavor::V09 => {
+            // Same sections as V07 with the change-detect bit inverted.
+            let mut wire = *cfg;
+            wire.disable_changedetect = !cfg.disable_changedetect;
+            config_to_set_packets(&wire)
+        }
     }
 }
 
@@ -1273,4 +1328,32 @@ mod tests {
         );
         assert_eq!(last, [0xD2, 0x32, section::PRESET_AUTO_DETECT, 1, 0, 0]);
     }
+
+    #[test]
+    fn change_detect_polarity_by_flavor() {
+        // fw >= 0.7.5 sends socket_change_detect (1 = on) in byte 3.
+        let mut buf = [0u8; 64];
+        buf[0] = 0x30;
+        buf[1] = 0x7F;
+        buf[63] = 0xFF;
+        buf[3] = 1; // detection ON on new fw
+        buf[6] = 0b10; // clock link, no external clock
+        buf[59] = 1;
+        let new = decode_config_lenient_with(FwFlavor::V09, &buf).unwrap();
+        assert!(!new.disable_changedetect);
+        assert!(new.clock_link && !new.external_clock);
+        assert!(decode_rx_ring(&buf).unwrap());
+        let old = decode_config_lenient_with(FwFlavor::V07, &buf).unwrap();
+        assert!(old.disable_changedetect);
+        // Encoder writes the wire polarity back.
+        let find = |pk: &Vec<[u8; PACKET_LEN]>| {
+            pk.iter()
+                .find(|p| p[2] == section::SOCKET_CHANGE_DETECT)
+                .map(|p| p[3])
+        };
+        let v09 = config_to_set_packets_with(FwFlavor::V09, &new);
+        let v07 = config_to_set_packets_with(FwFlavor::V07, &new);
+        assert_ne!(find(&v09), find(&v07));
+    }
+
 }

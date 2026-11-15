@@ -76,10 +76,7 @@ impl<T: Transport> Device<T> {
     /// (v0.7 flavor only — legacy decode is always strict).
     pub fn read_config_lenient(&mut self) -> Result<DeviceConfig, DeviceError> {
         let buf = self.read_config_frame_with_retry()?;
-        match self.fw_flavor {
-            FwFlavor::V07 => Ok(protocol::decode_config_lenient(&buf)?),
-            FwFlavor::Legacy => Ok(protocol::decode_config_legacy(&buf)?),
-        }
+        Ok(protocol::decode_config_lenient_with(self.fw_flavor, &buf)?)
     }
 
     fn read_config_frame_with_retry(&mut self) -> Result<Vec<u8>, DeviceError> {
@@ -174,6 +171,24 @@ impl<T: Transport> Device<T> {
     /// Send CONFIG_ACK to enable socket power on v1.5+ boards. Required
     /// before sockets behave normally if `DeviceConfig::need_confirmation`
     /// is true.
+    /// fw 0.9+: read the USB RX ringbuffer setting (READ_CONFIG byte 59).
+    pub fn read_rx_ring(&mut self) -> Result<bool, DeviceError> {
+        let buf = self.read_config_frame_with_retry()?;
+        Ok(protocol::decode_rx_ring(&buf)?)
+    }
+
+    /// fw 0.9+: set the USB RX ringbuffer. The board saves and reboots
+    /// (re-enumerates) when the value changes; an unchanged value is a no-op.
+    pub fn set_rx_ring(&mut self, on: bool) -> Result<(), DeviceError> {
+        self.transport.drain()?;
+        self.transport.send(&protocol::encode_config_cmd(
+            protocol::cfg::SET_RX_RING,
+            on as u8,
+            0,
+        ))?;
+        Ok(())
+    }
+
     pub fn confirm_config(&mut self) -> Result<(), DeviceError> {
         self.transport.drain()?;
         self.transport.send(&protocol::encode_config_ack())?;
