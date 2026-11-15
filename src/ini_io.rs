@@ -372,6 +372,7 @@ mod tests {
             last_preset: 7,
             lock_clockrate: true,
             external_clock: false,
+            clock_link: false,
             clock_rate: ClockRate::Pal,
             socket1: SocketConfig {
                 enabled: true,

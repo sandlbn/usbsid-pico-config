@@ -293,7 +293,11 @@ pub struct DeviceConfig {
     pub last_preset: u8,
 
     pub lock_clockrate: bool,
+    /// READ_CONFIG byte 6 bit 0.
     pub external_clock: bool,
+    /// fw 0.9+: clock link (byte 6 bit 1). READ-ONLY here; set with
+    /// `LINK_CLOCK` (0x84), which saves and reboots the board.
+    pub clock_link: bool,
     pub clock_rate: ClockRate,
 
     pub socket1: SocketConfig,
@@ -427,30 +431,53 @@ pub struct Capabilities {
 
 /// Firmware wire-format flavor.
 ///
-/// `V07` is current firmware; `Legacy` is v0.5/v0.6 (byte 22 = mirrored,
+/// `V07` is v0.7.0–v0.7.4; `Legacy` is v0.5/v0.6 (byte 22 = mirrored,
 /// bytes 12/13 + 23/24 = split `{chiptype, clonetype}`, sections
 /// `0xC..=0x10` absent).
+///
+/// `V075` (v0.7.5–v0.8.x): READ_CONFIG byte 3 / SET_CONFIG section `0xF`
+/// changed meaning from "disable change detection" to
+/// `socket_change_detect` (1 = enabled). `V09` (v0.9+): additionally byte 59
+/// = USB RX ringbuffer. The [`DeviceConfig::disable_changedetect`] field
+/// keeps its meaning across flavors; the codec inverts the wire bit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum FwFlavor {
     #[default]
     V07,
     Legacy,
+    V075,
+    V09,
 }
 
-/// `Legacy` when the firmware string parses as `0.x` with `x < 7`, else
-/// `V07`. Unparseable input defaults to `V07`.
+impl FwFlavor {
+    /// Byte 3 / section 0xF carries `socket_change_detect` (1 = on).
+    pub fn change_detect_is_enable_bit(self) -> bool {
+        matches!(self, FwFlavor::V075 | FwFlavor::V09)
+    }
+}
+
+/// `Legacy` below 0.7, `V07` for 0.7.0–0.7.4, `V075` for 0.7.5–0.8.x,
+/// `V09` for 0.9 and newer. Accepts build suffixes such as
+/// `"0.9.0-20261113"`. Unparseable input defaults to `V07`.
 pub fn fw_flavor_from_version(s: &str) -> FwFlavor {
     let trimmed = s.trim().trim_start_matches(|c: char| c == 'v' || c == 'V');
+    let num = |p: Option<&str>| -> Option<u32> {
+        let p = p?;
+        let digits: String = p.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse().ok()
+    };
     let mut parts = trimmed.split('.');
-    let major: u32 = match parts.next().and_then(|p| p.parse().ok()) {
+    let major = match num(parts.next()) {
         Some(m) => m,
         None => return FwFlavor::V07,
     };
-    let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-    if major == 0 && minor < 7 {
-        FwFlavor::Legacy
-    } else {
-        FwFlavor::V07
+    let minor = num(parts.next()).unwrap_or(0);
+    let patch = num(parts.next()).unwrap_or(0);
+    match (major, minor, patch) {
+        (0, m, _) if m < 7 => FwFlavor::Legacy,
+        (0, 7, p) if p < 5 => FwFlavor::V07,
+        (0, 7, _) | (0, 8, _) => FwFlavor::V075,
+        _ => FwFlavor::V09,
     }
 }
 
@@ -568,7 +595,12 @@ mod tests {
         assert_eq!(fw_flavor_from_version("0.5.0"), FwFlavor::Legacy);
         assert_eq!(fw_flavor_from_version("0.6.4"), FwFlavor::Legacy);
         assert_eq!(fw_flavor_from_version("0.7.0"), FwFlavor::V07);
-        assert_eq!(fw_flavor_from_version("1.0.0"), FwFlavor::V07);
+        assert_eq!(fw_flavor_from_version("0.7.4"), FwFlavor::V07);
+        // Byte 3 became socket_change_detect in 0.7.5.
+        assert_eq!(fw_flavor_from_version("0.7.5"), FwFlavor::V075);
+        assert_eq!(fw_flavor_from_version("0.8.0"), FwFlavor::V075);
+        assert_eq!(fw_flavor_from_version("0.9.0-20261113"), FwFlavor::V09);
+        assert_eq!(fw_flavor_from_version("1.0.0"), FwFlavor::V09);
         // Unparseable defaults to V07 — current is the safe assumption.
         assert_eq!(fw_flavor_from_version(""), FwFlavor::V07);
         assert_eq!(fw_flavor_from_version("garbage"), FwFlavor::V07);
